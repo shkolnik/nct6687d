@@ -1,0 +1,92 @@
+name: release
+
+# Packaging-only fork of Fred78290/nct6687d. Branch roles: `main` is a byte-identical mirror of
+# upstream (synced by fast-forward, never edited); `packaging` = main + this file. Upstream has
+# no tags, no releases and a fixed MODULE_VERSION, so every push to `packaging` builds and
+# publishes nct6687d-dkms_<YYYY.MM.DD>+git<sha7>_all.deb (commit date and sha of the packaging
+# head) under the auto-created tag v<YYYY.MM.DD>-git<sha7>, using upstream's own debian/
+# packaging. Publishing to apt is gated separately: shkolnik/pkg indexes a release only after
+# its .redirect PR is merged there.
+
+on:
+  push:
+    branches: ["packaging"]
+
+# Workflow level, never job level: a job-level `permissions:` replaces this block wholesale and
+# would silently drop id-token/attestations, breaking the deb attestation below.
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Derive version from the packaging head
+        id: meta
+        run: |
+          date=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y.%m.%d HEAD)
+          sha7=${GITHUB_SHA::7}
+          git fetch --quiet origin main
+          upstream=$(git merge-base HEAD origin/main)
+          echo "deb_version=${date}+git${sha7}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${date}-git${sha7}" >> "$GITHUB_OUTPUT"
+          echo "upstream=${upstream}" >> "$GITHUB_OUTPUT"
+          echo "version ${date}+git${sha7}, upstream commit ${upstream}"
+
+      - name: Build the DKMS source package (debian:trixie, matches the Proxmox 9 hosts)
+        env:
+          DEB_VERSION: ${{ steps.meta.outputs.deb_version }}
+          UPSTREAM: ${{ steps.meta.outputs.upstream }}
+        run: |
+          mkdir dist
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/dist -e DEB_VERSION -e UPSTREAM -e GITHUB_SHA \
+            debian:trixie bash -euo pipefail -c '
+              apt-get -qq update
+              apt-get -qq install -y --no-install-recommends debhelper dh-dkms dkms build-essential >/dev/null
+              cp -r /src /tmp/build && cd /tmp/build
+              printf "nct6687d-dkms (%s) unstable; urgency=low\n\n  * Upstream Fred78290/nct6687d at commit %s, packaged from shkolnik/nct6687d %s.\n\n -- shkolnik release workflow <jshkolnik@gmail.com>  %s\n" \
+                "$DEB_VERSION" "$UPSTREAM" "$GITHUB_SHA" "$(date -R)" > debian/changelog
+              dpkg-buildpackage -b -rfakeroot -us -uc
+              cp ../nct6687d-dkms_*.deb /dist/
+            '
+          ls -l dist
+          dpkg-deb -I dist/*.deb | grep -E '^ (Package|Version|Architecture):'
+
+      - name: Attest build provenance
+        # Before SHA256SUMS is added, so every file in dist/ is a build subject.
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Publish formal release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS)
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "nct6687d-dkms ${{ steps.meta.outputs.deb_version }}" \
+            --notes "DKMS package of upstream Fred78290/nct6687d at ${{ steps.meta.outputs.upstream }}, built from shkolnik/nct6687d ${GITHUB_SHA}. Debian version ${{ steps.meta.outputs.deb_version }}."
+
+      - name: Notify package repository
+        # Dispatches shkolnik/pkg's check-releases workflow, which opens a review PR proposing
+        # this release for the apt repo. Fine-grained PAT scoped to Actions:write on that repo
+        # only. Never fail a release over this: pkg's weekly cron catches a missed dispatch.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PKG_TRIGGER_TOKEN }}
+        run: |
+          echo "token account: $(gh api user --jq .login)"
+          # --ref is load-bearing: a token scoped to Actions:write cannot resolve the default branch.
+          gh workflow run check-releases.yml -R shkolnik/pkg --ref main
