@@ -1,0 +1,83 @@
+name: release
+
+# Packaging-only fork of Fred78290/nct6687d. Upstream has no tags, no releases and a fixed
+# MODULE_VERSION, so this fork versions by date: tag vYYYY.MM.DD (the date of the upstream commit
+# being packaged) builds nct6687d-dkms_YYYY.MM.DD+git<sha7>_all.deb with upstream's own debian/
+# packaging, attests it, and publishes a formal GitHub release that shkolnik/pkg indexes.
+# Nothing here touches the driver source; sync upstream by merging Fred78290/nct6687d main.
+
+on:
+  push:
+    tags: ["v*"]
+
+# Workflow level, never job level: a job-level `permissions:` replaces this block wholesale and
+# would silently drop id-token/attestations, breaking the deb attestation below.
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version from the tag
+        id: meta
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! [[ "$tag" =~ ^v([0-9]{4}\.[0-9]{2}\.[0-9]{2})$ ]]; then
+            echo "tag '$tag' must be vYYYY.MM.DD (date of the upstream commit packaged)" >&2
+            exit 1
+          fi
+          echo "deb_version=${BASH_REMATCH[1]}+git${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the DKMS source package (debian:trixie, matches the Proxmox 9 hosts)
+        env:
+          DEB_VERSION: ${{ steps.meta.outputs.deb_version }}
+        run: |
+          mkdir dist
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/dist":/dist -e DEB_VERSION -e GITHUB_SHA \
+            debian:trixie bash -euo pipefail -c '
+              apt-get -qq update
+              apt-get -qq install -y --no-install-recommends debhelper dh-dkms dkms build-essential >/dev/null
+              cp -r /src /tmp/build && cd /tmp/build
+              printf "nct6687d-dkms (%s) unstable; urgency=low\n\n  * Upstream Fred78290/nct6687d at commit %s, packaged by shkolnik/nct6687d.\n\n -- shkolnik release workflow <jshkolnik@gmail.com>  %s\n" \
+                "$DEB_VERSION" "$GITHUB_SHA" "$(date -R)" > debian/changelog
+              dpkg-buildpackage -b -rfakeroot -us -uc
+              cp ../nct6687d-dkms_*.deb /dist/
+            '
+          ls -l dist
+          dpkg-deb -I dist/*.deb | grep -E '^ (Package|Version|Architecture):'
+
+      - name: Attest build provenance
+        # Before SHA256SUMS is added, so every file in dist/ is a build subject.
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Publish formal release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "nct6687d-dkms $GITHUB_REF_NAME" \
+            --notes "DKMS package of upstream Fred78290/nct6687d at ${GITHUB_SHA}. Debian version ${{ steps.meta.outputs.deb_version }}."
+
+      - name: Notify package repository
+        # Dispatches shkolnik/pkg's check-releases workflow, which opens a review PR proposing
+        # this release for the apt repo. Fine-grained PAT scoped to Actions:write on that repo
+        # only. Never fail a release over this: pkg's weekly cron catches a missed dispatch.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PKG_TRIGGER_TOKEN }}
+        run: |
+          echo "token account: $(gh api user --jq .login)"
+          # --ref is load-bearing: a token scoped to Actions:write cannot resolve the default branch.
+          gh workflow run check-releases.yml -R shkolnik/pkg --ref main
